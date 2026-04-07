@@ -1,10 +1,8 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
-#include <condition_variable>
-#include <cstdint>
-#include <mutex>
+#include <cstddef>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -12,25 +10,16 @@
 #include "../graph.h"
 #include "mst_types.h"
 
-class Barrier {
-    std::mutex mtx;
-    std::condition_variable cv;
-    std::size_t waiting;
-    std::size_t total;
-    std::size_t generation = 0;
+template <typename WeightT>
+struct BestEdgeCandidate {
+    bool valid = false;
+    Edge<WeightT> edge{};
 
-public:
-    explicit Barrier(std::size_t n) : waiting(n), total(n) {}
-
-    void arrive_and_wait() {
-        std::unique_lock<std::mutex> lock(mtx);
-        const std::size_t gen = generation;
-        if (--waiting == 0) {
-            ++generation;
-            waiting = total;
-            cv.notify_all();
-        } else {
-            cv.wait(lock, [&] { return generation != gen; });
+    void update(const Edge<WeightT>& e) {
+        if (!valid || e.weight < edge.weight ||
+            (e.weight == edge.weight && e.id < edge.id)) {
+            edge = e;
+            valid = true;
         }
     }
 };
@@ -49,92 +38,127 @@ MSTResult<WeightT> boruvka_mst(
         result.connected = true;
         return result;
     }
-    if (thread_count == 0) thread_count = 1;
-    if (edges.empty()) {
-        result.connected = (n == 1);
+
+    if (thread_count == 0) {
+        thread_count = 1;
+    }
+
+    if (n == 1) {
+        result.connected = true;
         return result;
     }
 
-    const std::size_t m = edges.size();
-    const std::size_t tcount = std::min(thread_count, m);
+    if (edges.empty()) {
+        result.connected = false;
+        return result;
+    }
 
     DSU<NodeId> dsu(n);
     std::size_t components = n;
     result.edges.reserve(n - 1);
 
-    std::vector<std::vector<Edge<WeightT>>> local_best(tcount, std::vector<Edge<WeightT>>(n));
-    std::vector<std::vector<char>> local_valid(tcount, std::vector<char>(n, 0));
-    std::vector<Edge<WeightT>> best(n);
-    std::vector<char> valid(n, 0);
+    const std::size_t m = edges.size();
 
-    std::atomic<bool> keep_going{true};
-    Barrier scan_done(tcount + 1);
-    Barrier round_done(tcount + 1);
+    // We keep these arrays indexed by vertex id / current component root id.
+    std::vector<NodeId> comp_of_vertex(n);
+    std::vector<char> is_root(n, 0);
+    std::vector<NodeId> roots;
 
-    std::vector<std::thread> workers;
-    workers.reserve(tcount);
+    while (components > 1) {
+        // Snapshot the current component id for every vertex.
+        for (NodeId v = 0; v < n; ++v) {
+            comp_of_vertex[v] = dsu.find(v);
+        }
 
-    for (std::size_t t = 0; t < tcount; ++t) {
-        const std::size_t left = (t * m) / tcount;
-        const std::size_t right = ((t + 1) * m) / tcount;
+        // Collect the active component roots for this round.
+        roots.clear();
+        std::fill(is_root.begin(), is_root.end(), 0);
 
-        workers.emplace_back([&, t, left, right] {
-            auto& lbest = local_best[t];
-            auto& lvalid = local_valid[t];
-
-            while (true) {
-                const auto& dsu_ro = static_cast<const DSU<NodeId>&>(dsu);
-
-                for (std::size_t i = left; i < right; ++i) {
-                    const auto& e = edges[i];
-                    const NodeId ru = dsu_ro.find(e.u);
-                    const NodeId rv = dsu_ro.find(e.v);
-                    if (ru == rv) continue;
-
-                    mst_detail::update_best_edge(lvalid[ru], lbest[ru], e);
-                    mst_detail::update_best_edge(lvalid[rv], lbest[rv], e);
-                }
-
-                scan_done.arrive_and_wait();
-                round_done.arrive_and_wait();
-
-                if (!keep_going.load(std::memory_order_acquire)) return;
-                std::fill(lvalid.begin(), lvalid.end(), 0);
-            }
-        });
-    }
-
-    while (true) {
-        scan_done.arrive_and_wait();
-
-        std::fill(valid.begin(), valid.end(), 0);
-        for (std::size_t t = 0; t < tcount; ++t) {
-            for (NodeId r = 0; r < n; ++r) {
-                if (!local_valid[t][r]) continue;
-                mst_detail::update_best_edge(valid[r], best[r], local_best[t][r]);
+        for (NodeId v = 0; v < n; ++v) {
+            const NodeId r = comp_of_vertex[v];
+            if (!is_root[r]) {
+                is_root[r] = 1;
+                roots.push_back(r);
             }
         }
 
+        // No active roots means something is inconsistent, but just stop safely.
+        if (roots.empty()) {
+            break;
+        }
+
+        const std::size_t tcount = std::min<std::size_t>(thread_count, std::max<std::size_t>(1, m));
+        std::vector<std::vector<BestEdgeCandidate<WeightT>>> local_best(
+            tcount, std::vector<BestEdgeCandidate<WeightT>>(n));
+
+        // Scan edges in parallel.
+        std::vector<std::thread> workers;
+        workers.reserve(tcount);
+
+        for (std::size_t t = 0; t < tcount; ++t) {
+            const std::size_t left = (t * m) / tcount;
+            const std::size_t right = ((t + 1) * m) / tcount;
+
+            workers.emplace_back([&, t, left, right] {
+                auto& best = local_best[t];
+
+                for (std::size_t i = left; i < right; ++i) {
+                    const auto& e = edges[i];
+
+                    const NodeId ru = comp_of_vertex[e.u];
+                    const NodeId rv = comp_of_vertex[e.v];
+
+                    if (ru == rv) {
+                        continue; // internal edge, not useful this round
+                    }
+
+                    best[ru].update(e);
+                    best[rv].update(e);
+                }
+            });
+        }
+
+        for (auto& th : workers) {
+            th.join();
+        }
+
+        // Merge local answers into one best outgoing edge per component.
+        std::vector<BestEdgeCandidate<WeightT>> best(n);
+
+        for (const NodeId r : roots) {
+            for (std::size_t t = 0; t < tcount; ++t) {
+                if (local_best[t][r].valid) {
+                    best[r].update(local_best[t][r].edge);
+                }
+            }
+        }
+
+        // Union the chosen edges. This is done sequentially for simplicity.
         bool merged_any = false;
-        for (NodeId r = 0; r < n && components > 1; ++r) {
-            if (!valid[r]) continue;
-            const auto& e = best[r];
+
+        for (const NodeId r : roots) {
+            if (!best[r].valid) {
+                continue;
+            }
+
+            const auto& e = best[r].edge;
             if (dsu.unite(e.u, e.v)) {
                 result.edges.push_back(e);
                 result.total_weight += e.weight;
                 --components;
                 merged_any = true;
+
+                if (components == 1) {
+                    break;
+                }
             }
         }
 
-        const bool finished = !merged_any || components <= 1;
-        if (finished) keep_going.store(false, std::memory_order_release);
-
-        round_done.arrive_and_wait();
-        if (finished) break;
+        // If nothing merged, the graph is disconnected.
+        if (!merged_any) {
+            break;
+        }
     }
-
-    for (auto& worker : workers) worker.join();
 
     result.connected = (components == 1);
     return result;
