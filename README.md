@@ -1,6 +1,6 @@
 # Parallel Algorithms Benchmark Tool
 
-This project implements three parallel algorithms, inspired by research papers, for three classic problem families: Minimum Spanning Tree (MST), Shortest Path, and Sorting. It also provides a benchmarking tool designed to compare these parallel algorithms against their classical counterparts on large inputs, in order to evaluate their performance, scalability, and practical advantages.
+This project implements parallel algorithms, inspired by research papers, for three classic problem families: Minimum Spanning Tree (MST), Shortest Path, and Sorting. It also provides a benchmarking tool designed to compare these parallel algorithms against their classical counterparts on large inputs, in order to evaluate their performance, scalability, and practical advantages.
 
 ## How benchmarks are run and compared
 
