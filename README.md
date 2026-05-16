@@ -41,16 +41,6 @@ https://github.com/user-attachments/assets/285c855b-8655-4790-9544-467bb9deaa6f
 
 
 
-## Parallel implementations
-
-### Parallel Borůvka (MST)
-**Classical idea**: Borůvka’s algorithm (1920s) grows an MST by repeating rounds: for each connected component, pick the cheapest edge that leaves that component, then add those edges and merge components until one component remains.
-the components are maintained with a disjoint-set(union-find)
-**How we parrallize it**:
-The heavy work is scanning all edges to compute, for each component root, the best outgoing edge. Our implementation splits the edge list across thread workers; each thread maintains local “best edge per component root” arrays.
-Reducing the the scan of all edges every iteration, Potentially improve the performence by the number of threads
-**Results and explanations**
-<img width="554" height="209" alt="image" src="https://github.com/user-attachments/assets/127f9106-98fc-4c9d-8f47-8f6e523de504" />
 
 
 
